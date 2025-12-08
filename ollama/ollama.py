@@ -312,7 +312,63 @@ def _render_field_specs(
         if field.description:
             parts.append(field.description)
         lines.append("  " + " | ".join(parts))
+    nested = _render_nested_dataclasses(cls)
+    if nested:
+        lines.append("")
+        lines.append(nested)
     return "\n".join(lines)
+
+
+def _render_nested_dataclasses(root_cls: type[Any]) -> str:
+    """Describe dataclass fields reachable from the root dataclass.
+
+    Some models ignore list element type hints unless we repeat nested schemas.
+    """
+
+    lines: list[str] = []
+    seen: set[type[Any]] = set()
+
+    def visit_type(tp: Any) -> None:
+        origin = get_origin(tp)
+        if origin is not None:
+            for arg in get_args(tp):
+                visit_type(arg)
+            return
+        if inspect.isclass(tp) and dataclasses.is_dataclass(tp):
+            visit_class(tp)
+
+    def visit_class(cls: type[Any]) -> None:
+        if cls in seen:
+            return
+        seen.add(cls)
+
+        type_hints = get_type_hints(cls)
+        for field in dataclasses.fields(cls):
+            visit_type(type_hints.get(field.name, field.type))
+
+        if cls is root_cls:
+            return
+
+        lines.append(f"Nested class: {cls.__module__}.{cls.__qualname__}")
+        lines.append("Fields:")
+        for field in dataclasses.fields(cls):
+            type_hints = get_type_hints(cls)
+            ann = type_hints.get(field.name, field.type)
+            required = field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING
+            lines.append(
+                "  "
+                + " | ".join(
+                    [
+                        f"- {field.name}",
+                        f"type={_format_type(ann)}",
+                        "required" if required else "optional",
+                    ]
+                )
+            )
+        lines.append("")
+
+    visit_class(root_cls)
+    return "\n".join(line for line in lines if line).strip()
 
 
 def _build_json_prompt(
@@ -365,10 +421,55 @@ def _instantiate_class(cls: type[Any], payload: Any) -> Any:
         raise OllamaStructuredError(
             f"JSON payload must be an object to instantiate {cls.__qualname__}, got {type(payload).__name__}."
         )
+
+    def _convert_value(value: Any, hint: Any) -> Any:
+        if value is None:
+            return None
+
+        origin = get_origin(hint)
+        args = get_args(hint)
+
+        # Optional[T] -> unwrap to T
+        if origin is not None and type(None) in args:
+            non_none = [a for a in args if a is not type(None)]
+            hint = non_none[0] if len(non_none) == 1 else hint
+            origin = get_origin(hint)
+            args = get_args(hint)
+
+        # Dataclass recursion
+        if inspect.isclass(hint) and dataclasses.is_dataclass(hint):
+            return _instantiate_class(hint, value)
+
+        # Collections
+        if origin in (list, tuple, set):
+            elem_type = args[0] if args else Any
+            converted = [_convert_value(v, elem_type) for v in (value or [])]
+            if origin is tuple:
+                return tuple(converted)
+            if origin is set:
+                return set(converted)
+            return list(converted)
+
+        if origin is dict and len(args) == 2:
+            key_t, val_t = args
+            return { _convert_value(k, key_t): _convert_value(v, val_t) for k, v in (value or {}).items() }
+
+        return value
+
     try:
         if _PydanticBaseModel is not None and issubclass(cls, _PydanticBaseModel):
             if hasattr(cls, "model_validate"):
                 return cls.model_validate(payload)
+
+        if dataclasses.is_dataclass(cls):
+            type_hints = get_type_hints(cls)
+            kwargs = {}
+            for field in dataclasses.fields(cls):
+                hint = type_hints.get(field.name, field.type)
+                if field.name in payload:
+                    kwargs[field.name] = _convert_value(payload[field.name], hint)
+            return cls(**kwargs)
+
         return cls(**payload)
     except TypeError as exc:
         raise OllamaStructuredError(
