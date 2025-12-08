@@ -6,11 +6,11 @@ Lightweight client for structured JSON calls to an Ollama server. Works with dat
 
 SSH (recommended):
 ```bash
-pip install git+ssh://git@github.com/<your-username>/ollama-structured.git@v0.1.0
+pip install git+ssh://git@github.com/<your-username>/ollama-structured.git@v0.1.1
 ```
 HTTPS:
 ```bash
-pip install git+https://github.com/<your-username>/ollama-structured.git@v0.1.0
+pip install git+https://github.com/<your-username>/ollama-structured.git@v0.1.1
 ```
 Editable from a local clone:
 ```bash

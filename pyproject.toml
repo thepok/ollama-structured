@@ -1,6 +1,6 @@
 [project]
 name = "ollama-structured"
-version = "0.1.0"
+version = "0.1.1"
 description = "Structured JSON client for Ollama (dataclasses/pydantic)."
 authors = [{ name = "Marcel" }]
 readme = "README.md"
