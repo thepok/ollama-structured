@@ -7,6 +7,7 @@ import importlib
 import inspect
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Iterable, TypeVar, get_args, get_origin, get_type_hints
 
@@ -394,18 +395,46 @@ def _load_json_payload(raw_text: str) -> Any:
     stripped = raw_text.strip()
     if not stripped:
         raise OllamaStructuredError("Model response was empty; expected JSON content")
+
+    # 1) Strict JSON first.
     try:
         return json.loads(stripped)
-    except json.JSONDecodeError:
-        candidate = _extract_json_substring(stripped)
-        if candidate is None:
-            raise OllamaStructuredError("Response did not contain valid JSON content") from None
+    except json.JSONDecodeError as exc:
+        last_exc: Exception = exc
+
+    # 2) Remove common Markdown fences (```json ... ```).
+    unfenced = _strip_code_fences(stripped)
+    if unfenced != stripped:
+        try:
+            return json.loads(unfenced)
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+
+    # 3) Extract the first balanced JSON-like object/array from surrounding text.
+    extracted = _extract_first_balanced_json(unfenced) or _extract_json_substring(unfenced)
+    if extracted is None:
+        raise OllamaStructuredError("Response did not contain valid JSON content") from None
+
+    # 4) Try strict JSON again with a tiny sanitizer (trailing commas).
+    sanitized = _remove_trailing_commas(extracted)
+    for candidate in (extracted, sanitized):
         try:
             return json.loads(candidate)
         except json.JSONDecodeError as exc:
-            raise OllamaStructuredError(
-                f"Response did not contain valid JSON content: {exc}"
-            ) from exc
+            last_exc = exc
+
+    # 5) Fallback: accept Python-literal dict/list (e.g., single quotes) via ast.literal_eval.
+    # This is common when models "almost" output JSON. We still return normal Python
+    # structures for downstream instantiation.
+    try:
+        import ast
+
+        parsed = ast.literal_eval(extracted)
+        return _normalize_literal_eval(parsed)
+    except Exception as exc:
+        raise OllamaStructuredError(
+            f"Response did not contain valid JSON content: {last_exc}"
+        ) from exc
 
 
 def _extract_json_substring(text: str) -> str | None:
@@ -414,6 +443,91 @@ def _extract_json_substring(text: str) -> str | None:
     if start == -1 or end == -1 or end <= start:
         return None
     return text[start : end + 1]
+
+
+_FENCE_RE = re.compile(r"^```(?:json|JSON)?\s*([\s\S]*?)\s*```$", re.MULTILINE)
+
+
+def _strip_code_fences(text: str) -> str:
+    match = _FENCE_RE.match(text.strip())
+    if not match:
+        return text.strip()
+    return (match.group(1) or "").strip()
+
+
+_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+
+
+def _remove_trailing_commas(text: str) -> str:
+    # Repeatedly remove trailing commas before closing braces/brackets.
+    prev = None
+    cur = text
+    for _ in range(10):
+        prev = cur
+        cur = _TRAILING_COMMA_RE.sub(r"\1", cur)
+        if cur == prev:
+            break
+    return cur
+
+
+def _extract_first_balanced_json(text: str) -> str | None:
+    """Return the first balanced {...} or [...] substring, ignoring braces in strings."""
+    s = text
+    start = None
+    stack: list[str] = []
+    in_string = False
+    escape = False
+
+    def is_open(ch: str) -> bool:
+        return ch in "{["
+
+    def is_close(ch: str) -> bool:
+        return ch in "}]"
+
+    def matches(open_ch: str, close_ch: str) -> bool:
+        return (open_ch == "{" and close_ch == "}") or (open_ch == "[" and close_ch == "]")
+
+    for i, ch in enumerate(s):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+
+        if start is None:
+            if is_open(ch):
+                start = i
+                stack.append(ch)
+            continue
+
+        if is_open(ch):
+            stack.append(ch)
+            continue
+        if is_close(ch) and stack and matches(stack[-1], ch):
+            stack.pop()
+            if not stack and start is not None:
+                return s[start : i + 1]
+
+    return None
+
+
+def _normalize_literal_eval(value: Any) -> Any:
+    """Normalize ast.literal_eval output into JSON-like structures."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            # JSON requires string keys; most schemas expect that anyway.
+            out[str(k)] = _normalize_literal_eval(v)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_literal_eval(v) for v in value]
+    return value
 
 
 def _instantiate_class(cls: type[Any], payload: Any) -> Any:
